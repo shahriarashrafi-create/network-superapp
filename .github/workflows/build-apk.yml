@@ -1,256 +1,121 @@
-name: Build Super App APK
+name: Build Royesh APK From ZIP
 
 on:
-  workflow_dispatch:
-
   push:
-    paths:
-      - "*.zip"
+    branches: [main]
+    paths: ['**/*.zip', '.github/workflows/build-apk.yml']
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Optional repository-relative ZIP path'
+        required: false
+        type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
-    name: Build Android APK
+    name: Build and Publish Royesh APK
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-
-      # --------------------------------------------------
-      # 1. دریافت Repository
-      # --------------------------------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-
-      # --------------------------------------------------
-      # 2. پیدا کردن ZIP پروژه
-      #
-      # Push:
-      # همان ZIP تغییرکرده در Commit
-      #
-      # Manual:
-      # آخرین ZIP ثبت‌شده در Git
-      # --------------------------------------------------
-      - name: Find project ZIP
-        id: zip
-        shell: bash
-        run: |
-          set -e
-
-          ZIP_FILE=""
-
-          echo "Event: ${{ github.event_name }}"
-
-          if [ "${{ github.event_name }}" = "push" ]; then
-
-            ZIP_FILE=$(git diff-tree \
-              --no-commit-id \
-              --name-only \
-              --root \
-              -r "$GITHUB_SHA" \
-              -- "*.zip" \
-              | awk 'index($0, "/") == 0 { print; exit }')
-
-          fi
-
-          # اگر اجرای دستی بود یا ZIP از Push پیدا نشد
-          if [ -z "$ZIP_FILE" ]; then
-
-            ZIP_FILE=$(
-              git ls-files "*.zip" \
-              | awk 'index($0, "/") == 0' \
-              | while IFS= read -r file; do
-
-                  TIMESTAMP=$(git log -1 --format=%ct -- "$file")
-
-                  if [ -n "$TIMESTAMP" ]; then
-                    printf "%s\t%s\n" "$TIMESTAMP" "$file"
-                  fi
-
-                done \
-              | sort -nr \
-              | head -n 1 \
-              | cut -f2-
-            )
-
-          fi
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found in repository root."
-            exit 1
-          fi
-
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: ZIP file does not exist:"
-            echo "$ZIP_FILE"
-            exit 1
-          fi
-
-          echo "Using ZIP:"
-          echo "$ZIP_FILE"
-
-          echo "file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
-
-
-      # --------------------------------------------------
-      # 3. استخراج ZIP
-      # --------------------------------------------------
-      - name: Extract project
-        shell: bash
-        run: |
-          set -e
-
-          rm -rf extracted
-          mkdir -p extracted
-
-          unzip -q "${{ steps.zip.outputs.file }}" -d extracted
-
-          echo "ZIP extracted successfully."
-          echo ""
-          echo "Project files:"
-          find extracted -maxdepth 4 -type f | head -100
-
-
-      # --------------------------------------------------
-      # 4. پیدا کردن Android / Gradle Project
-      # --------------------------------------------------
-      - name: Find Android project
-        id: project
-        shell: bash
-        run: |
-          set -e
-
-          SETTINGS=$(find extracted \
-            -type f \
-            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
-            -printf "%d %p\n" \
-            | sort -n \
-            | head -n 1 \
-            | cut -d' ' -f2-)
-
-          if [ -z "$SETTINGS" ]; then
-            echo "ERROR: Android/Gradle project not found inside ZIP."
-            exit 1
-          fi
-
-          PROJECT_DIR=$(dirname "$SETTINGS")
-
-          echo "Android project found:"
-          echo "$PROJECT_DIR"
-
-          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-
-
-      # --------------------------------------------------
-      # 5. نصب Java
-      # --------------------------------------------------
-      - name: Set up Java
-        uses: actions/setup-java@v6
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
 
-      # --------------------------------------------------
-      # 6. تنظیم Gradle
-      # --------------------------------------------------
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+      - name: Install Android Packages
+        run: sdkmanager 'platforms;android-35' 'build-tools;34.0.0'
 
-
-      # --------------------------------------------------
-      # 7. بررسی Gradle Wrapper
-      # --------------------------------------------------
-      - name: Prepare Gradle wrapper
-        shell: bash
-        working-directory: ${{ steps.project.outputs.dir }}
-        run: |
-          set -e
-
-          if [ ! -f "./gradlew" ]; then
-            echo "ERROR: gradlew not found."
-            echo "The ZIP must contain the complete Gradle Wrapper."
-            exit 1
-          fi
-
-          if [ ! -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
-            echo "ERROR: gradle-wrapper.properties not found."
-            exit 1
-          fi
-
-          chmod +x ./gradlew
-
-          echo "Gradle wrapper ready."
-
-
-      # --------------------------------------------------
-      # 8. نمایش اطلاعات Build
-      # --------------------------------------------------
-      - name: Show build environment
-        shell: bash
-        working-directory: ${{ steps.project.outputs.dir }}
-        run: |
-          java -version
-          ./gradlew --version
-
-
-      # --------------------------------------------------
-      # 9. ساخت Debug APK
-      # --------------------------------------------------
-      - name: Build Debug APK
-        shell: bash
-        working-directory: ${{ steps.project.outputs.dir }}
-        run: |
-          set -e
-
-          ./gradlew \
-            assembleDebug \
-            --stacktrace \
-            --no-daemon
-
-
-      # --------------------------------------------------
-      # 10. پیدا کردن APK ساخته‌شده
-      # --------------------------------------------------
-      - name: Find APK
-        id: apk
+      - name: Find and Safely Extract ZIP
+        id: extract
+        env:
+          INPUT_ZIP: ${{ inputs.zip_path }}
+          BEFORE_SHA: ${{ github.event.before }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, subprocess, zipfile, stat
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          requested = os.environ.get('INPUT_ZIP', '').strip()
+          candidates = []
+          if requested:
+              p = (root / requested).resolve()
+              if not p.is_relative_to(root) or p.suffix.lower() != '.zip' or not p.is_file():
+                  raise SystemExit('Invalid ZIP path')
+              candidates = [p]
+          else:
+              before = os.environ.get('BEFORE_SHA', '')
+              if os.environ['GITHUB_EVENT_NAME'] == 'push' and before and set(before) != {'0'}:
+                  names = subprocess.check_output(['git', 'diff', '--name-only', '--diff-filter=ACMRT', '-z', before, os.environ['GITHUB_SHA']]).decode().split('\0')
+                  candidates = [root / n for n in names if n.lower().endswith('.zip') and (root / n).is_file()]
+              if not candidates:
+                  candidates = [p for p in root.rglob('*') if p.is_file() and p.suffix.lower() == '.zip' and '.git' not in p.parts]
+          if len(candidates) != 1:
+              raise SystemExit('Expected one ZIP; use workflow_dispatch zip_path to choose a file.')
+          dest = pathlib.Path(os.environ['RUNNER_TEMP']) / 'android-source'
+          dest.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(candidates[0]) as archive:
+              if sum(i.file_size for i in archive.infolist()) > 512 * 1024 * 1024:
+                  raise SystemExit('ZIP is too large')
+              for i in archive.infolist():
+                  path = (dest / i.filename).resolve()
+                  if not path.is_relative_to(dest.resolve()) or stat.S_ISLNK(i.external_attr >> 16):
+                      raise SystemExit('Unsafe ZIP member')
+              archive.extractall(dest)
+          wrappers = list(dest.rglob('gradlew'))
+          if len(wrappers) != 1:
+              raise SystemExit('Expected exactly one Gradle project')
+          project = wrappers[0].parent
+          if not any((project / n).is_file() for n in ['settings.gradle', 'settings.gradle.kts']):
+              raise SystemExit('Gradle settings missing')
+          if not (project / 'gradle/wrapper/gradle-wrapper.jar').is_file():
+              raise SystemExit('Gradle wrapper JAR missing')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'project_dir={project}\n')
+          print(f'Building {candidates[0].name}')
+          PY
 
-          APK=$(find "${{ steps.project.outputs.dir }}" \
-            -type f \
-            -path "*/build/outputs/apk/debug/*.apk" \
-            ! -name "*androidTest*" \
-            | head -n 1)
+      - name: Test Core and Build Debug APK
+        env:
+          PROJECT_DIR: ${{ steps.extract.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace :core:test :app:assembleDebug
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/output/app-debug.apk"
 
-          if [ -z "$APK" ]; then
-            echo "ERROR: Build completed but APK was not found."
-            exit 1
-          fi
-
-          echo "APK found:"
-          echo "$APK"
-
-          rm -rf apk-output
-          mkdir -p apk-output
-
-          cp "$APK" apk-output/SuperApp-debug.apk
-
-          echo "apk=apk-output/SuperApp-debug.apk" >> "$GITHUB_OUTPUT"
-
-
-      # --------------------------------------------------
-      # 11. آپلود APK در GitHub Actions
-      # --------------------------------------------------
-      - name: Upload APK
-        uses: actions/upload-artifact@v7
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: SuperApp-APK
-          path: apk-output/SuperApp-debug.apk
+          name: royesh-android-apk
+          path: output/app-debug.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="android-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$TAG" output/app-debug.apk \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Royesh Android Build $GITHUB_RUN_NUMBER" \
+            --notes "Royesh local-first development build. Not a production release." --latest
+          echo '## Royesh APK Download' >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/app-debug.apk" >> "$GITHUB_STEP_SUMMARY"
